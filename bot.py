@@ -1,252 +1,357 @@
-import os, io, re, logging, requests, datetime as dt
-import numpy as np
+
+import os
+import io
+import base64
+import math
+import datetime as dt
+import logging
+import asyncio
+from typing import Optional, Tuple, Dict, Any, List
+
+import requests
 import pandas as pd
+import numpy as np
 import yfinance as yf
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-from telegram import Update, InputFile
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+# ------------------------- Config & Logging -------------------------
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# ========= Config =========
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "ضع_التوكن_هنا")
+logging.basicConfig(
+    format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("asa3edni-bot")
 
-# OCR (image-only)
-OCR_SPACE_API_KEY = os.getenv("OCR_SPACE_API_KEY", "helloworld")
-OCR_SPACE_URL = "https://api.ocr.space/parse/image"
+if not TELEGRAM_TOKEN:
+    log.error("Missing TELEGRAM_TOKEN env var.")
+if not FINNHUB_API_KEY:
+    log.warning("Missing FINNHUB_API_KEY (analyst & news will be limited).")
+if not OPENAI_API_KEY:
+    log.warning("Missing OPENAI_API_KEY (AI summaries & image analysis disabled).")
 
-# Trading-news providers (set your preferred provider key; priority order: FINNHUB > POLYGON > ALPHAVANTAGE)
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY")          # https://finnhub.io/ (company-news)
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY")          # https://polygon.io/ (reference/news)
-ALPHAVANTAGE_API_KEY = os.getenv("ALPHAVANTAGE_API_KEY")# https://www.alphavantage.co/ (news-sentiment)
+# ------------------------- Helpers -------------------------
 
-# ========= Logging =========
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+SYMBOL_MAP_PRICE = {
+    # Indices (use ETFs for stability)
+    "US100": "QQQ",  # NASDAQ100 ETF
+    "US500": "SPY",  # S&P500 ETF
+    "US30": "DIA",   # Dow Jones ETF
+    "GOLD": "XAUUSD=X",  # Spot gold. Alternative "GC=F" futures, or ETF GLD.
+}
 
-# ========= OCR helpers =========
-TICKER_RE = re.compile(r"\b[A-Z]{1,6}\b")
-TIME_RE = re.compile(r"\b(1m|3m|5m|15m|30m|45m|1h|2h|4h|60m|90m|1d|1D|D|1wk|1mo)\b", re.IGNORECASE)
-BLACKLIST = {"OPEN","HIGH","LOW","CLOSE","BUY","SELL","CALL","PUT","USD","EUR","GOLD","INDEX","TIME","PRICE","VOLUME"}
+SYMBOL_MAP_ANALYST = {
+    "US100": "QQQ",
+    "US500": "SPY",
+    "US30": "DIA",
+    "GOLD": "GLD",
+}
 
-def ocr_space_extract_text(image_bytes: bytes) -> str:
-    files = {'filename': ('image.jpg', image_bytes)}
-    data = {'apikey': OCR_SPACE_API_KEY, 'language': 'eng', 'isOverlayRequired': False}
-    r = requests.post(OCR_SPACE_URL, files=files, data=data, timeout=60)
-    r.raise_for_status()
-    j = r.json()
-    if not j.get("IsErroredOnProcessing") and j.get("ParsedResults"):
-        return j["ParsedResults"][0].get("ParsedText", "")
-    raise ValueError(f"OCR error: {j}")
+def normalize_symbol(sym: str) -> str:
+    s = sym.strip().upper().replace(" ", "")
+    return SYMBOL_MAP_PRICE.get(s, s)
 
-def extract_ticker_and_tf(text: str):
-    up = text.upper()
-    tickers = [t for t in TICKER_RE.findall(up) if t not in BLACKLIST]
-    tickers = list(dict.fromkeys(tickers))
-    m = TIME_RE.search(text)
-    tf = (m.group(1).lower() if m else None) or "1d"
-    sym = tickers[0] if tickers else None
-    return sym, tf
+def analyst_symbol(sym: str) -> str:
+    s = sym.strip().upper().replace(" ", "")
+    return SYMBOL_MAP_ANALYST.get(s, s)
 
-# ========= Technicals =========
-def ema(series: pd.Series, span: int) -> pd.Series: return series.ewm(span=span, adjust=False).mean()
-def rsi(series: pd.Series, period: int = 14) -> pd.Series:
-    d = series.diff()
-    up = d.clip(lower=0); down = -d.clip(upper=0)
-    ma_up = up.ewm(com=period-1, adjust=False).mean()
-    ma_down = down.ewm(com=period-1, adjust=False).mean()
-    rs = ma_up / (ma_down + 1e-9); return 100 - (100/(1+rs))
-def macd(series: pd.Series):
-    ema12, ema26 = ema(series,12), ema(series,26)
-    macd_line = ema12 - ema26
-    signal = macd_line.ewm(span=9, adjust=False).mean()
-    hist = macd_line - signal
-    return macd_line, signal, hist
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    h,l,c = df["High"], df["Low"], df["Close"]
-    pc = c.shift(1)
-    tr = pd.concat([h-l, (h-pc).abs(), (l-pc).abs()], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-def detect_patterns(df: pd.DataFrame):
-    out = []
-    o,h,l,c = df["Open"].iloc[-2:], df["High"].iloc[-2:], df["Low"].iloc[-2:], df["Close"].iloc[-2:]
-    body = (c - o).abs().iloc[-1]
-    rng = (h - l).iloc[-1]
-    upper_w = (h - max(c.iloc[-1], o.iloc[-1])).iloc[-1]
-    lower_w = (min(c.iloc[-1], o.iloc[-1]) - l).iloc[-1]
-    if rng > 0 and body / rng < 0.1: out.append("Doji")
-    if lower_w > 2*body and upper_w < body: out.append("Hammer")
-    if upper_w > 2*body and lower_w < body: out.append("Shooting Star")
-    prev_body = (c.iloc[0] - o.iloc[0]); last_body = (c.iloc[1] - o.iloc[1])
-    if last_body>0 and prev_body<0 and c.iloc[1]>o.iloc[0] and o.iloc[1]<c.iloc[0]: out.append("Bullish Engulfing")
-    if last_body<0 and prev_body>0 and o.iloc[1]>c.iloc[0] and c.iloc[1]<o.iloc[0]: out.append("Bearish Engulfing")
-    return out[:3]
-
-# ========= Data & News =========
-def fetch_history(symbol: str, interval: str = "1d", lookback: str = "6mo"):
-    lookback = "60d" if interval in ["1h","2h","4h","60m","90m"] else "6mo"
-    return yf.download(symbol, period=lookback, interval=interval, progress=False)
-
-def news_from_finnhub(symbol: str, n=3):
-    if not FINNHUB_API_KEY: return None
-    # company-news needs from/to dates (last 7 days)
-    today = dt.date.today()
-    frm = today - dt.timedelta(days=7)
-    url = f"https://finnhub.io/api/v1/company-news?symbol={symbol}&from={frm}&to={today}&token={FINNHUB_API_KEY}"
-    r = requests.get(url, timeout=30); r.raise_for_status()
-    items = r.json()
-    if not isinstance(items, list): return None
-    items = sorted(items, key=lambda x: x.get("datetime",0), reverse=True)[:n]
-    out = []
-    for it in items:
-        headline = it.get("headline","")
-        src = it.get("source","")
-        link = it.get("url","")
-        out.append(f"• {headline} — {src}\n{link}")
-    return "\n".join(out) if out else None
-
-def news_from_polygon(symbol: str, n=3):
-    if not POLYGON_API_KEY: return None
-    url = f"https://api.polygon.io/v2/reference/news?ticker={symbol}&limit={n}&apiKey={POLYGON_API_KEY}"
-    r = requests.get(url, timeout=30); r.raise_for_status()
-    js = r.json()
-    results = js.get("results", [])
-    out = []
-    for it in results[:n]:
-        title = it.get("title","")
-        src = it.get("publisher",{}).get("name","")
-        link = it.get("article_url","")
-        out.append(f"• {title} — {src}\n{link}")
-    return "\n".join(out) if out else None
-
-def news_from_alphavantage(symbol: str, n=3):
-    if not ALPHAVANTAGE_API_KEY: return None
-    url = f"https://www.alphavantage.co/query?function=NEWS_SENTIMENT&tickers={symbol}&sort=LATEST&apikey={ALPHAVANTAGE_API_KEY}"
-    r = requests.get(url, timeout=30); r.raise_for_status()
-    js = r.json()
-    feed = js.get("feed", [])[:n]
-    out = []
-    for it in feed:
-        title = it.get("title","")
-        src = it.get("source","")
-        link = it.get("url","")
-        out.append(f"• {title} — {src}\n{link}")
-    return "\n".join(out) if out else None
-
-def fetch_trading_news(symbol: str, n=3):
-    # Priority: Finnhub -> Polygon -> AlphaVantage
-    for fn in (news_from_finnhub, news_from_polygon, news_from_alphavantage):
-        try:
-            res = fn(symbol, n) if fn != news_from_alphavantage else fn(symbol, n)
-            if res: return res
-        except Exception as e:
-            logging.warning(f"News provider error: {e}")
-    return "لا توجد أخبار حديثة من مزودي الأخبار المخصّصين."
-
-# ========= Chart image =========
-def make_chart(df: pd.DataFrame, symbol: str):
-    fig = plt.figure(figsize=(8,4.2))
-    plt.plot(df.index, df["Close"], label="Close")
-    plt.plot(df.index, ema(df["Close"],20), label="EMA20")
-    plt.plot(df.index, ema(df["Close"],50), label="EMA50")
-    plt.title(f"{symbol} – Close & EMAs")
-    plt.legend()
-    plt.tight_layout()
-    buf = io.BytesIO()
-    fig.savefig(buf, format="png"); plt.close(fig)
-    buf.seek(0)
-    return buf
-
-# ========= Core analysis =========
-def analyze_symbol(symbol: str, interval: str):
-    df = fetch_history(symbol, interval=interval)
-    if df.empty: raise ValueError("لا توجد بيانات للسهم/الإطار المختار.")
-    df = df.dropna().copy()
-    price = float(df["Close"].iloc[-1])
-    ema20 = float(ema(df["Close"],20).iloc[-1])
-    ema50 = float(ema(df["Close"],50).iloc[-1])
-    rsi_v = float(rsi(df["Close"],14).iloc[-1])
-    macd_line, signal, hist = macd(df["Close"])
-    macd_v, signal_v, hist_v = float(macd_line.iloc[-1]), float(signal.iloc[-1]), float(hist.iloc[-1])
-    atr_v = float(atr(df,14).iloc[-1] if not np.isnan(atr(df,14).iloc[-1]) else df["Close"].diff().abs().rolling(14).mean().iloc[-1])
-    patterns = detect_patterns(df)
-
-    # Clear public-friendly signal
-    if ema20 > ema50 and rsi_v < 70 and macd_v > signal_v:
-        signal_txt = "🟢 شراء محتمل"
-    elif ema20 < ema50 and rsi_v > 30 and macd_v < signal_v:
-        signal_txt = "🔴 بيع محتمل"
-    else:
-        signal_txt = "🟡 انتظار"
-
-    trend_txt = "📈 صاعد" if ema20>ema50 else ("📉 هابط" if ema20<ema50 else "➡️ جانبي")
-    stop = price - 1.5*atr_v if ema20>=ema50 else price + 1.5*atr_v
-    target = price + 2.5*atr_v if ema20>=ema50 else price - 2.5*atr_v
-
-    # Liquidity (relative volume)
-    vol_ma20 = df["Volume"].rolling(20).mean().iloc[-1]
-    vol_ratio = float(df["Volume"].iloc[-1] / (vol_ma20 + 1e-9)) if not np.isnan(vol_ma20) else 1.0
-    liq_txt = "قوية" if vol_ratio>=1.5 else ("متوسطة" if vol_ratio>=0.8 else "ضعيفة")
-
-    text = f"""🔎 تحليل آلي واضح – {symbol}
-السعر: {price:.4f}
-الاتجاه: {trend_txt}
-الإشارة: {signal_txt}
-RSI(14): {rsi_v:.1f} | MACD: {macd_v:.3f}/{signal_v:.3f}
-📌 شموع: {", ".join(patterns) if patterns else "لا توجد إشارة واضحة"}
-💵 السيولة: {liq_txt} (x{vol_ratio:.2f} من متوسط 20 يوم)
-
-دخول افتراضي: قريب من السعر الحالي
-🛑 وقف: {stop:.3f}
-🎯 هدف: {target:.3f}
-⏱️ الإطار: {interval}
-(تنبيه: هذا مساعد تداول—not توصية ملزمة)
-"""
-    chart = make_chart(df, symbol)
-    news = fetch_trading_news(symbol, 3)
-    return text, chart, news
-
-# ========= Telegram handlers =========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("أرسل صورة للتشارت (بدون كتابة). سأستخرج الرمز والإطار تلقائيًا، أحلل الشموع والمؤشرات، وأجيب آخر أخبار من مزوّدات تداول.\nبديل: /stock NVDA 1h")
-
-async def stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("استخدم: /stock NVDA 1h")
-        return
-    symbol = context.args[0].upper()
-    interval = context.args[1] if len(context.args)>=2 else "1d"
+def yf_history(symbol: str, period="6mo", interval="1d") -> Optional[pd.DataFrame]:
     try:
-        text, chart, news = analyze_symbol(symbol, interval)
-        await update.message.reply_photo(photo=InputFile(chart, filename="chart.png"), caption=text)
-        await update.message.reply_text("📰 أخبار تداول:\n" + news)
+        df = yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=True)
+        if df is None or df.empty:
+            return None
+        df = df.dropna()
+        return df
     except Exception as e:
-        await update.message.reply_text(f"خطأ: {e}")
+        log.exception(f"yfinance error: {e}")
+        return None
+
+def ema(series: pd.Series, window: int) -> pd.Series:
+    return series.ewm(span=window, adjust=False).mean()
+
+def rsi(series: pd.Series, window: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    roll_up = pd.Series(gain).rolling(window).mean()
+    roll_down = pd.Series(loss).rolling(window).mean()
+    rs = roll_up / (roll_down + 1e-9)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi.index = series.index
+    return rsi
+
+def atr(df: pd.DataFrame, window: int = 14) -> pd.Series:
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        (high - low),
+        (high - prev_close).abs(),
+        (low - prev_close).abs()
+    ], axis=1).max(axis=1)
+    return tr.rolling(window).mean()
+
+def compute_tech(df: pd.DataFrame) -> Dict[str, Any]:
+    df = df.copy()
+    df['EMA20'] = ema(df['Close'], 20)
+    df['EMA50'] = ema(df['Close'], 50)
+    df['RSI14'] = rsi(df['Close'], 14)
+    df['ATR14'] = atr(df, 14)
+    last = df.iloc[-1]
+    trend = "صاعد ⬆️" if last['EMA20'] > last['EMA50'] else "هابط ⬇️"
+    signal = "شراء مبدئي" if last['EMA20'] > last['EMA50'] and last['RSI14'] < 70 else (
+             "بيع/حذر" if last['EMA20'] < last['EMA50'] and last['RSI14'] > 30 else "محايد")
+    entry = float(last['Close'])
+    stop = round(entry - 1.5 * float(last['ATR14']), 4) if not np.isnan(last['ATR14']) else None
+    tp = round(entry + 2.0 * float(last['ATR14']), 4) if not np.isnan(last['ATR14']) else None
+    return {
+        "price": float(last['Close']),
+        "ema20": float(last['EMA20']),
+        "ema50": float(last['EMA50']),
+        "rsi14": float(last['RSI14']),
+        "atr14": float(last['ATR14'] if not np.isnan(last['ATR14']) else 0),
+        "trend": trend,
+        "signal": signal,
+        "entry": entry,
+        "stop": stop,
+        "tp": tp,
+    }
+
+# ------------------------- Finnhub -------------------------
+
+def _fh(path, params=None):
+    if not FINNHUB_API_KEY:
+        raise RuntimeError("FINNHUB_API_KEY missing")
+    base = "https://finnhub.io/api/v1"
+    params = params or {}
+    params["token"] = FINNHUB_API_KEY
+    r = requests.get(f"{base}/{path}", params=params, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+def finnhub_company_news(symbol: str, days: int = 3) -> List[Dict[str, Any]]:
+    """آخر أخبار الشركة (3 أيام افتراضيًا)."""
+    to = dt.date.today()
+    fr = to - dt.timedelta(days=days)
+    try:
+        data = _fh("company-news", {"symbol": symbol, "from": fr.isoformat(), "to": to.isoformat()})
+        # رجّع أهم 5
+        data = sorted(data, key=lambda x: x.get("datetime", 0), reverse=True)[:5]
+        return data
+    except Exception as e:
+        log.warning(f"company-news failed for {symbol}: {e}")
+        return []
+
+def finnhub_reco(symbol: str):
+    try:
+        data = _fh("stock/recommendation", {"symbol": symbol})
+        if not data: 
+            return None
+        last = sorted(data, key=lambda x: (x.get("period","")), reverse=True)[0]
+        return {
+            "buy": last.get("buy",0),
+            "hold": last.get("hold",0),
+            "sell": last.get("sell",0),
+            "strongBuy": last.get("strongBuy",0),
+            "strongSell": last.get("strongSell",0),
+            "period": last.get("period","")
+        }
+    except Exception as e:
+        log.warning(f"reco failed for {symbol}: {e}")
+        return None
+
+def finnhub_targets(symbol: str):
+    try:
+        data = _fh("stock/price-target", {"symbol": symbol})
+        if not data:
+            return None
+        return {
+            "targetMean": data.get("targetMean"),
+            "targetHigh": data.get("targetHigh"),
+            "targetLow": data.get("targetLow"),
+            "lastUpdated": data.get("lastUpdatedTime")
+        }
+    except Exception as e:
+        log.warning(f"targets failed for {symbol}: {e}")
+        return None
+
+# ------------------------- OpenAI -------------------------
+
+def openai_chat(messages: List[Dict[str, Any]], model: str = "gpt-4o-mini", max_tokens: int = 400) -> str:
+    if not OPENAI_API_KEY:
+        return "لتفعيل الملخص الذكي أضف OPENAI_API_KEY."
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    payload = {"model": model, "messages": messages, "max_tokens": max_tokens}
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
+    try:
+        j = r.json()
+        return j["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.warning(f"OpenAI response parsing error: {e} | {r.text[:200]}")
+        return "تعذّر الحصول على ملخص الذكاء الاصطناعي حالياً."
+
+def ai_summarize(symbol: str, tech: Dict[str, Any], news: List[Dict[str, Any]], analysts: str) -> str:
+    news_lines = []
+    for n in news[:4]:
+        headline = n.get("headline") or n.get("title") or ""
+        source = n.get("source", "")
+        news_lines.append(f"- {headline} ({source})")
+    tech_text = (
+        f"السعر: {tech['price']:.2f}, ترند: {tech['trend']}, إشارة: {tech['signal']}, "
+        f"RSI14: {tech['rsi14']:.1f}, EMA20: {tech['ema20']:.2f}, EMA50: {tech['ema50']:.2f}, ATR: {tech['atr14']:.3f}. "
+        f"مقترح: دخول {tech['entry']:.2f}, وقف {tech['stop']:.2f}، هدف {tech['tp']:.2f}."
+    )
+    user_text = (
+        f"حلّل باختصار {symbol} بلغة عربية مبسطة للجمهور العام.\n"
+        f"التحليل الفني: {tech_text}\n"
+        f"أهم الأخبار:\n" + ("\n".join(news_lines) if news_lines else "لا توجد أخبار مهمة.") + "\n"
+        f"رأي المحللين: {analysts or 'غير متاح'}\n"
+        f"اكتب 3-5 نقاط سريعة + خلاصة نهائية (ليست نصيحة استثمارية)."
+    )
+    messages = [
+        {"role": "system", "content": "أنت خبير أسواق مالية تكتب نقاط واضحة ومختصرة بالعربية."},
+        {"role": "user", "content": user_text},
+    ]
+    return openai_chat(messages, model="gpt-4o-mini", max_tokens=350)
+
+def ai_analyze_image(symbol: str, image_b64: str) -> str:
+    """يحلل صورة شارت (Base64) مع توجيه عام. يحتاج OPENAI_API_KEY."""
+    if not OPENAI_API_KEY:
+        return "لتفعيل تحليل الصور، أضف OPENAI_API_KEY."
+    url = "https://api.openai.com/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+    content = [
+        {"type": "text", "text": f"حلّل الشارت المرفق لـ {symbol}. قيّم الاتجاه ومستويات الدعم/المقاومة بإيجاز."},
+        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}
+    ]
+    payload = {
+        "model": "gpt-4o-mini",
+        "messages": [
+            {"role": "system", "content": "أنت خبير تحليل فني. قدّم نقاطًا قصيرة بالعربية."},
+            {"role": "user", "content": content}
+        ],
+        "max_tokens": 300
+    }
+    r = requests.post(url, headers=headers, json=payload, timeout=90)
+    try:
+        j = r.json()
+        return j["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        log.warning(f"OpenAI vision parse error: {e} | {r.text[:200]}")
+        return "تعذّر تحليل الصورة حالياً."
+
+# ------------------------- Telegram Handlers -------------------------
+
+HELP_TEXT = (
+"أهلاً 👋\n"
+"أوامر سريعة:\n"
+"• /ai SYM — ملخص ذكي (فني + أخبار + محللين). مثال: /ai AAPL أو /ai US100\n"
+"• /news SYM — آخر الأخبار فقط (من Finnhub)\n"
+"• ابعث صورة شارت + بعدها اكتب الرمز (مثال: AAPL) ثم استعمل /ai AAPL\n"
+"\nالمؤشرات المدعومة: US100→QQQ, US500→SPY, US30→DIA, GOLD→XAUUSD= X (سعر) & GLD (محللين)\n"
+"⚠️ ليس نصيحة استثمارية."
+)
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def news_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("استعمل: /news AAPL")
+        return
+    user_sym = context.args[0].upper()
+    sym = analyst_symbol(user_sym)
+    items = finnhub_company_news(sym, days=3) if FINNHUB_API_KEY else []
+    if not items:
+        await update.message.reply_text("لا توجد أخبار حالياً أو مفتاح Finnhub مفقود.")
+        return
+    lines = []
+    for it in items[:5]:
+        headline = it.get("headline") or it.get("title","")
+        src = it.get("source","")
+        url = it.get("url","")
+        lines.append(f"• {headline} ({src})\n{url}")
+    await update.message.reply_text("\n\n".join(lines))
 
 async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        file = await update.message.photo[-1].get_file()
-        img_bytes = await file.download_as_bytearray()
-        text_raw = ocr_space_extract_text(img_bytes)
-        symbol, interval = extract_ticker_and_tf(text_raw)
-        if not symbol:
-            await update.message.reply_text("ما قدرتش نحدد الرمز من الصورة. حاول بصورة أوضح أو استخدم /stock SYMBOL")
-            return
-        text, chart, news = analyze_symbol(symbol, interval)
-        await update.message.reply_photo(photo=InputFile(chart, filename="chart.png"), caption=f"📷 استخرجت: {symbol} ({interval})\n"+text)
-        await update.message.reply_text("📰 أخبار تداول:\n" + news)
-    except Exception as e:
-        await update.message.reply_text(f"خطأ في تحليل الصورة: {e}")
+    """استقبال صورة وتخزينها Base64 مؤقتاً للمستخدم."""
+    photo = update.message.photo[-1]  # أعلى دقة
+    file = await photo.get_file()
+    bio = await file.download_as_bytearray()
+    b64 = base64.b64encode(bio).decode("utf-8")
+    # خزّنها في user_data
+    context.user_data['last_image_b64'] = b64
+    await update.message.reply_text("تم استلام الصورة ✅\nابعث الرمز الآن (مثال: AAPL أو US100) ثم استخدم /ai SYMBOL.")
 
+def analyst_text_for(symbol: str) -> str:
+    sym = analyst_symbol(symbol)
+    parts = []
+    reco = finnhub_reco(sym) if FINNHUB_API_KEY else None
+    tgt = finnhub_targets(sym) if FINNHUB_API_KEY else None
+    if reco:
+        parts.append(f"({reco['period']}) StrongBuy {reco['strongBuy']}, Buy {reco['buy']}, Hold {reco['hold']}, Sell {reco['sell']}, StrongSell {reco['strongSell']}")
+    if tgt and tgt.get("targetMean"):
+        parts.append(f"الأهداف: متوسط {tgt['targetMean']}, أعلى {tgt['targetHigh']}, أدنى {tgt['targetLow']}")
+    return "\n".join(parts)
+
+async def ai_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text("استعمل: /ai AAPL\nويمكنك إرسال صورة الشارت قبل الأمر للحصول على قراءة بصرية.")
+        return
+    user_sym = context.args[0].upper()
+    sym_price = normalize_symbol(user_sym)
+    df = yf_history(sym_price, period="6mo", interval="1d")
+    if df is None:
+        await update.message.reply_text("لا توجد بيانات للسهم/المؤشر المطلوب.")
+        return
+    tech = compute_tech(df)
+
+    news = finnhub_company_news(analyst_symbol(user_sym), days=3) if FINNHUB_API_KEY else []
+    analysts = analyst_text_for(user_sym) if FINNHUB_API_KEY else ""
+
+    ai_summary = ai_summarize(user_sym, tech, news, analysts) if OPENAI_API_KEY else "لتفعيل الملخص الذكي، أضف OPENAI_API_KEY."
+    # إن وُجدت صورة محفوظة لهذا المستخدم، حللها
+    img_note = ""
+    b64 = context.user_data.get('last_image_b64')
+    if b64 and OPENAI_API_KEY:
+        img_note = "\n\n🖼️ تحليل الشارت:\n" + ai_analyze_image(user_sym, b64)[:1200]
+
+    # رسالة نهائية
+    txt = (
+        f"📊 {user_sym}\n"
+        f"السعر الحالي: {tech['price']:.2f}\n"
+        f"الترند: {tech['trend']} | الإشارة: {tech['signal']}\n"
+        f"RSI14: {tech['rsi14']:.1f} | EMA20: {tech['ema20']:.2f} | EMA50: {tech['ema50']:.2f}\n"
+        f"مقترح: دخول {tech['entry']:.2f} | وقف {tech['stop']:.2f} | هدف {tech['tp']:.2f}\n"
+        f"\n🧠 ملخص الذكاء الاصطناعي:\n{ai_summary}"
+        f"\n\n📰 أهم الأخبار ({len(news)}): " + ("لا يوجد" if not news else "") +
+        "".join([f"\n• {n.get('headline','')} ({n.get('source','')})" for n in news[:4]]) +
+        (f"\n\n👥 رأي المحللين:\n{analysts}" if analysts else "") +
+        img_note +
+        "\n\n⚠️ هذا المحتوى للتثقيف وليس نصيحة استثمارية."
+    )
+    await update.message.reply_text(txt)
+
+# ------------------------- Main -------------------------
 def main():
-    if not TELEGRAM_TOKEN or TELEGRAM_TOKEN == "ضع_التوكن_هنا":
-        raise SystemExit("⚠️ ضع TELEGRAM_TOKEN في المتغيرات أولًا.")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("stock", stock))
-    app.add_handler(MessageHandler(filters.PHOTO | (filters.Document.IMAGE), photo_handler))
-    app.run_polling()
+    if not TELEGRAM_TOKEN:
+        raise SystemExit("TELEGRAM_TOKEN غير موجود.")
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("news", news_cmd))
+    app.add_handler(CommandHandler("ai", ai_cmd))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    log.info("Bot starting...")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()

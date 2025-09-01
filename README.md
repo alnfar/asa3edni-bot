@@ -1,18 +1,34 @@
-# Asa3edni Bot – Full Auto (Trading-news providers)
-- Photo-only via OCR.Space (no caption needed)
-- Clear public signals: Buy/Sell/Wait + Entry/Stop/Target
-- Indicators: EMA20/50, RSI, MACD, ATR, simple candle patterns
-- News priority: Finnhub -> Polygon -> Alpha Vantage (set API keys via Variables)
 
-### Deploy (Railway/GitHub)
-Files required: bot.py, requirements.txt, Procfile, runtime.txt
+# Asa3edni AI Bot (Telegram)
 
-Environment Variables:
-- TELEGRAM_TOKEN=<BotFather token>  [required]
-- OCR_SPACE_API_KEY=helloworld      [or your own OCR key]
-- FINNHUB_API_KEY=<optional>        [preferred]
-- POLYGON_API_KEY=<optional>
-- ALPHAVANTAGE_API_KEY=<optional>
+بوت تيليجرام للمساعدة في تحليل الأسواق:
+- تحليل فني تلقائي (EMA/RSI/ATR + اتجاه + دخول/وقف/هدف).
+- أخبار حديثة من Finnhub + رأي المحللين (توصيات/أهداف سعرية).
+- ملخص ذكاء اصطناعي بالعربية (OpenAI GPT-4o-mini).
+- تحليل صورة الشارت (ترسل صورة ثم الرمز → `/ai AAPL`).
 
-Start command (Procfile):
-worker: python bot.py
+## النشر على Railway
+1) ارفع الملفات لهذا الريبو (أو استعمل ZIP).
+2) على Railway أنشئ **Worker** من GitHub repo.
+3) أضف المتغيرات (Variables):
+   - `TELEGRAM_TOKEN` : توكن البوت من BotFather.
+   - `FINNHUB_API_KEY` : مفتاح Finnhub.io (مجاني يكفي كبداية).
+   - `OPENAI_API_KEY` : مفتاح OpenAI (لملخصات AI وتحليل الصور).
+4) اضغط **Deploy**.
+
+> لو المفتاح غير موجود، الخاصية المقابلة تتعطل تلقائياً بدون أن تفشل عملية البناء.
+
+## الأوامر
+- `/start` أو `/help` : قائمة سريعة.
+- `/news SYMBOL` : آخر الأخبار (مثال: `/news AAPL`).
+- `/ai SYMBOL` : ملخص ذكي (يمزج الفني + الأخبار + رأي المحللين).
+
+## المؤشرات الشائعة
+- US100 → QQQ
+- US500 → SPY
+- US30 → DIA
+- GOLD → XAUUSD=X (سعر) & GLD (محللين)
+
+## ملاحظات
+- ليس نصيحة استثمارية.
+- لو أردت تغيير النماذج أو النِسَب، عدل الدوال في `bot.py`.
