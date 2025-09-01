@@ -1,34 +1,8 @@
+# Asa3edni Bot (v5)
+- Telegram + Finnhub + OpenAI (Vision + News + Price).
+- Buttons UI, symbol aliases (US100/US500/US30/XAUUSD...).
 
-# Asa3edni AI Bot (Telegram)
-
-بوت تيليجرام للمساعدة في تحليل الأسواق:
-- تحليل فني تلقائي (EMA/RSI/ATR + اتجاه + دخول/وقف/هدف).
-- أخبار حديثة من Finnhub + رأي المحللين (توصيات/أهداف سعرية).
-- ملخص ذكاء اصطناعي بالعربية (OpenAI GPT-4o-mini).
-- تحليل صورة الشارت (ترسل صورة ثم الرمز → `/ai AAPL`).
-
-## النشر على Railway
-1) ارفع الملفات لهذا الريبو (أو استعمل ZIP).
-2) على Railway أنشئ **Worker** من GitHub repo.
-3) أضف المتغيرات (Variables):
-   - `TELEGRAM_TOKEN` : توكن البوت من BotFather.
-   - `FINNHUB_API_KEY` : مفتاح Finnhub.io (مجاني يكفي كبداية).
-   - `OPENAI_API_KEY` : مفتاح OpenAI (لملخصات AI وتحليل الصور).
-4) اضغط **Deploy**.
-
-> لو المفتاح غير موجود، الخاصية المقابلة تتعطل تلقائياً بدون أن تفشل عملية البناء.
-
-## الأوامر
-- `/start` أو `/help` : قائمة سريعة.
-- `/news SYMBOL` : آخر الأخبار (مثال: `/news AAPL`).
-- `/ai SYMBOL` : ملخص ذكي (يمزج الفني + الأخبار + رأي المحللين).
-
-## المؤشرات الشائعة
-- US100 → QQQ
-- US500 → SPY
-- US30 → DIA
-- GOLD → XAUUSD=X (سعر) & GLD (محللين)
-
-## ملاحظات
-- ليس نصيحة استثمارية.
-- لو أردت تغيير النماذج أو النِسَب، عدل الدوال في `bot.py`.
+## Env
+- TELEGRAM_TOKEN
+- FINNHUB_API_KEY
+- OPENAI_API_KEY
